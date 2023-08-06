@@ -3,34 +3,143 @@ use std::u8;
 
 use anyhow::Context;
 
-use crate::metadata::{ColumnMetaData, DType, TableMetaData};
+use crate::data::{get_max, get_min};
+use crate::metadata::{ColumnMetaData, TableMetaData};
+use crate::{get_dtype, DValue, DType};
 use anyhow::{anyhow, Result};
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
+use std::io::ErrorKind;
 type IndexSize = u64;
 use lz4_flex;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum DValue {
-    String(String),
-    Uint64(u64),
-}
-
 const ROWS_PER_BLOCK: usize = 1024;
 
-pub fn write_data(
-    root_path: &PathBuf,
-    table: &TableMetaData,
-    data: &Vec<Vec<DValue>>,
-) -> Result<()> {
-    struct ColumnWriter<'a> {
-        data_file: File,
-        index_file: File,
-        col: &'a ColumnMetaData,
-        position: IndexSize,
+
+#[derive(PartialEq, Debug)]
+
+enum IndexValue {
+    Uint64(u64),
+    String([u8; 8])
+}
+
+impl IndexValue {
+    fn from_dvalue(value: &DValue) -> IndexValue {
+        match value {
+            DValue::String(s) => {
+                let mut bytes = [0; 8];
+                // use the first 8 bytes of the string
+                let s_bytes = &s.as_bytes();
+                let n_to_copy = std::cmp::min(s_bytes.len(), bytes.len());
+                bytes[0..n_to_copy].copy_from_slice(&s_bytes[0..n_to_copy]);
+                IndexValue::String(bytes)
+            },
+            DValue::Uint64(n) => IndexValue::Uint64(*n),
+        }
     }
 
-    let mut writers: Vec<ColumnWriter<'_>> = table
+    fn write_bytes(&self, bytes: &mut [u8], ) ->() {
+        match self {
+            IndexValue::String(s) => {
+                bytes.copy_from_slice(s);
+            }
+            IndexValue::Uint64(u) => {
+                bytes.copy_from_slice(&u.to_be_bytes());
+            }
+        };
+    }
+
+    fn from_bytes(bytes: &[u8], dtype: DType) -> IndexValue {
+        match dtype {
+            DType::String => {
+                let mut s_bytes = [0; 8];
+                s_bytes.copy_from_slice(bytes);
+                IndexValue::String(s_bytes)
+            },
+            DType::Uint64 => {
+                let array: [u8; 8] = bytes.try_into().expect("Slice with incorrect length");
+                let u = u64::from_be_bytes(array);
+                IndexValue::Uint64(u)
+            }
+        }
+    }
+    
+}
+
+
+
+struct IndexEntry {
+    start_position: IndexSize, // stored as 8 bytes big endian
+    size: IndexSize, // stored as 8 bytes big endian. In reality you don't need this but it's much simpler if you have it.
+    min: IndexValue, // stored as 8 bytes, either the u64 in big endian or the first 8 bytes of the string
+    max: IndexValue, // stored as 8 bytes, either the u64 in big endian or the first 8 bytes of the string
+}
+impl IndexEntry {
+    fn to_bytes(&self) -> [u8; 32]{
+        let mut bytes = [0; 32];
+        bytes[0..8].copy_from_slice(&self.start_position.to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.size.to_be_bytes());
+        self.min.write_bytes(&mut bytes[16..24]);
+        self.max.write_bytes(&mut bytes[24..32]);
+        bytes
+    }
+    fn from_bytes(bytes: &[u8; 32], dtype: DType) -> IndexEntry {
+        let start_position = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let size = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let min = IndexValue::from_bytes(&bytes[16..24], dtype);
+        let max = IndexValue::from_bytes(&bytes[24..32], dtype);
+        IndexEntry {
+            start_position,
+            size,
+            min,
+            max,
+        }
+    }
+    
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_entry_to_bytes() {
+        let entry = IndexEntry {
+            start_position: 1,
+            size: 2,
+            min: IndexValue::Uint64(3),
+            max: IndexValue::from_dvalue(&DValue::String("longlonglong".to_string())),
+        };
+        let bytes = entry.to_bytes();
+        let expected: [u8; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 2,
+            0, 0, 0, 0, 0, 0, 0, 3,
+            b'l', b'o', b'n', b'g', b'l', b'o', b'n', b'g',
+        ];
+        assert_eq!(bytes, expected);
+    }
+    #[test]
+    fn test_index_entry_from_dvalue() {
+        assert_eq!(IndexValue::from_dvalue(&DValue::Uint64(42)), IndexValue::Uint64(42));
+        assert_eq!(IndexValue::from_dvalue(&DValue::String("".to_string())), IndexValue::String([0, 0, 0, 0, 0 ,0 ,0 ,0]));
+        assert_eq!(IndexValue::from_dvalue(&DValue::String("a".to_string())), IndexValue::String([b'a', 0, 0, 0, 0 ,0 ,0 ,0]));
+        assert_eq!(IndexValue::from_dvalue(&DValue::String("longlonglong".to_string())), IndexValue::String([b'l', b'o', b'n', b'g', b'l', b'o', b'n', b'g',]));
+
+    }
+}
+
+struct ColumnWriter<'a> {
+    data_file: File,
+    index_file: File,
+    col: &'a ColumnMetaData,
+    position: IndexSize,
+}
+fn create_writers<'a>(
+    root_path: &PathBuf,
+    table: &'a TableMetaData,
+) -> Result<Vec<ColumnWriter<'a>>> {
+    table
         .columns
         .iter()
         .map(|col| {
@@ -47,16 +156,68 @@ pub fn write_data(
                 .open(index_path(&root_path, &table.name, &col.name))
                 .with_context(|| "Couldn't open index file")?;
 
-            let data_file_metadata = data_file.metadata().with_context(|| "Couldn't get metadata")?;
+            let data_file_metadata = data_file
+                .metadata()
+                .with_context(|| "Couldn't get metadata")?;
 
             Ok(ColumnWriter {
                 data_file,
                 index_file,
                 col,
-                position: data_file_metadata.len()
+                position: data_file_metadata.len(),
             })
         })
-        .collect::<Result<Vec<ColumnWriter>>>()?;
+        .collect::<Result<Vec<ColumnWriter>>>()
+}
+
+struct ColumnReader<'a> {
+    data_file: File,
+    index_file: File,
+    col: &'a ColumnMetaData,
+    position: IndexSize,
+}
+
+fn create_readers<'a>(
+    root_path: &PathBuf,
+    table: &TableMetaData,
+    columns: &'a Vec<ColumnMetaData>,
+) -> Result<Vec<ColumnReader<'a>>> {
+    columns
+        .iter()
+        .map(|col| {
+            let data_file = OpenOptions::new()
+                .write(false)
+                .append(false)
+                .create(false)
+                .open(data_path(&root_path, &table.name, &col.name))
+                .with_context(|| "Couldn't open data file")?;
+            let index_file = OpenOptions::new()
+                .write(false)
+                .append(false)
+                .create(false)
+                .open(index_path(&root_path, &table.name, &col.name))
+                .with_context(|| "Couldn't open index file")?;
+
+            let data_file_metadata = data_file
+                .metadata()
+                .with_context(|| "Couldn't get metadata")?;
+
+            Ok(ColumnReader {
+                data_file,
+                index_file,
+                col,
+                position: data_file_metadata.len(),
+            })
+        })
+        .collect::<Result<Vec<ColumnReader>>>()
+}
+
+pub fn write_data(
+    root_path: &PathBuf,
+    table: &TableMetaData,
+    data: &Vec<Vec<DValue>>,
+) -> Result<()> {
+    let mut writers = create_writers(root_path, table)?;
 
     for block in data.chunks(ROWS_PER_BLOCK) {
         struct BlockColumnState {
@@ -64,14 +225,14 @@ pub fn write_data(
             max: DValue,
             buf: Vec<u8>,
         }
-        let mut block_column_states: Vec<BlockColumnState> = block[0].iter().map(|val| {
-            BlockColumnState { 
-                min: val.clone(), 
+        let mut block_column_states: Vec<BlockColumnState> = block[0]
+            .iter()
+            .map(|val| BlockColumnState {
+                min: val.clone(),
                 max: val.clone(),
-                buf: Vec::new()
-            }
-        }).collect();
-
+                buf: Vec::new(),
+            })
+            .collect();
 
         for row in block {
             for (index, col) in row.iter().enumerate() {
@@ -87,7 +248,7 @@ pub fn write_data(
         }
 
         for (index, writer) in writers.iter_mut().enumerate() {
-            let col_state= &mut block_column_states[index];
+            let col_state = &mut block_column_states[index];
             let buf = &mut col_state.buf;
             let buf_size = buf.len();
 
@@ -104,25 +265,13 @@ pub fn write_data(
                 .write_all(&compress_output)
                 .with_context(|| "Couldn't write compressed data")?;
 
-            // prepare the entry in the index file
-            struct IndexEntry {
-                start_position: IndexSize, // stored as 8 bytes big endian
-                size: IndexSize, // stored as 8 bytes big endian. In reality you don't need this but it's much simpler if you have it.
-                min: DValue, // stored as 8 bytes, either the u64 in big endian or the first 8 bytes of the string
-                max: DValue, // stored as 8 bytes, either the u64 in big endian or the first 8 bytes of the string
-            }
             let index_entry = IndexEntry {
                 start_position: writer.position,
                 size: compressed_len as IndexSize,
-                min: col_state.min.clone(),
-                max: col_state.max.clone(),
+                min: IndexValue::from_dvalue(&col_state.min),
+                max: IndexValue::from_dvalue(&col_state.max),
             };
-            let mut index_bytes = Vec::new();
-
-            index_bytes.extend_from_slice(&index_entry.start_position.to_be_bytes());
-            index_bytes.extend_from_slice(&index_entry.size.to_be_bytes());
-            write_dvalue_index(&mut index_bytes, &index_entry.min)?;
-            write_dvalue_index(&mut index_bytes, &index_entry.max)?;
+            let index_bytes = index_entry.to_bytes();
 
             // write the index entry
             writer
@@ -137,59 +286,34 @@ pub fn write_data(
     Ok(())
 }
 
+fn read_all(root_path: &PathBuf, table: &TableMetaData) -> Result<Vec<Vec<DType>>> {
+    let mut rows = Vec::new();
+    let mut readers = create_readers(root_path, table, &table.columns)?;
+    let mut buffer = [0; 8];
+    loop {
+        match readers[0].index_file.read_exact(&mut buffer) {
+            Ok(_) => {
+                // Successfully read 8 bytes, process the data as required
+                println!("{:?}", buffer);
+            },
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                // Less than 8 bytes were left in the file or the file was empty
+                // Handle this case if necessary, otherwise break out of the loop
+                break;
+            },
+            Err(e) => return Err(e.into()), // Handle other errors
+        }
+    }
+
+    return Ok(rows);
+}
+
 fn index_path(root_path: &PathBuf, table_name: &String, column_name: &String) -> PathBuf {
     root_path.join(format!("{}.{}.index", table_name, column_name))
 }
 
 fn data_path(root_path: &PathBuf, table_name: &String, column_name: &String) -> PathBuf {
     root_path.join(format!("{}.{}.data", table_name, column_name))
-}
-
-fn get_dtype(value: &DValue) -> DType {
-    match value {
-        DValue::String(_) => DType::String,
-        DValue::Uint64(_) => DType::Uint64,
-    }
-}
-
-fn get_min<'a>(min_val: &'a DValue, new_val: &'a DValue) -> &'a DValue {
-    match (min_val, new_val) {
-        (DValue::String(min_s), DValue::String(new_s)) => {
-            if new_s < min_s {
-                new_val
-            } else {
-                min_val
-            }
-        }
-        (DValue::Uint64(min_u), DValue::Uint64(new_u)) => {
-            if new_u < min_u {
-                new_val
-            } else {
-                min_val
-            }
-        }
-        _ => panic!("Mismatched types"),
-    }
-}
-
-fn get_max<'a>(max_val: &'a DValue, new_val: &'a DValue) -> &'a DValue {
-    match (max_val, new_val) {
-        (DValue::String(max_s), DValue::String(new_s)) => {
-            if new_s > max_s {
-                new_val
-            } else {
-                max_val
-            }
-        }
-        (DValue::Uint64(max_u), DValue::Uint64(new_u)) => {
-            if new_u > max_u {
-                new_val
-            } else {
-                max_val
-            }
-        }
-        _ => panic!("Mismatched types"),
-    }
 }
 
 fn write_dvalue_data(bytes: &mut Vec<u8>, value: &DValue) -> Result<()> {
@@ -205,16 +329,3 @@ fn write_dvalue_data(bytes: &mut Vec<u8>, value: &DValue) -> Result<()> {
     Ok(())
 }
 
-fn write_dvalue_index(bytes: &mut Vec<u8>, value: &DValue) -> Result<()> {
-    match value {
-        DValue::String(s) => {
-            // only write the first 8 bytes of the string
-            let null_terminated = &(s.to_owned() + &"\0".repeat(8))[0..8];
-            bytes.extend_from_slice(&null_terminated.as_bytes()[0..8]);
-        }
-        DValue::Uint64(u) => {
-            bytes.extend_from_slice(&u.to_be_bytes());
-        }
-    };
-    Ok(())
-}

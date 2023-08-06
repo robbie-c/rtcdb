@@ -4,6 +4,8 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::DType;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TableMetaData {
     pub name: String,
@@ -34,15 +36,7 @@ impl ColumnMetaData {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum DType {
-    String,
-    Uint64,
-}
-
-
 #[derive(Serialize, Deserialize, Debug)]
-
 pub struct MetaData {
     pub(crate) tables: Vec<TableMetaData>,
 }
